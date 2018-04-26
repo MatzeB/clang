@@ -2294,7 +2294,7 @@ public:
   /// Invoked when we enter a tag definition that we're skipping.
   SkippedDefinitionContext ActOnTagStartSkippedDefinition(Scope *S, Decl *TD);
 
-  Decl *ActOnObjCContainerStartDefinition(Decl *IDecl);
+  void ActOnObjCContainerStartDefinition(Decl *IDecl);
 
   /// ActOnStartCXXMemberDeclarations - Invoked when we have parsed a
   /// C++ record definition's base-specifiers clause and are starting its
@@ -7980,19 +7980,20 @@ public:
       const SourceLocation *ProtoLocs, SourceLocation EndProtoLoc,
       const ParsedAttributesView &AttrList);
 
-  Decl *ActOnStartClassImplementation(
+  ObjCImplementationDecl *ActOnStartClassImplementation(
                     SourceLocation AtClassImplLoc,
                     IdentifierInfo *ClassName, SourceLocation ClassLoc,
                     IdentifierInfo *SuperClassname,
                     SourceLocation SuperClassLoc);
 
-  Decl *ActOnStartCategoryImplementation(SourceLocation AtCatImplLoc,
-                                         IdentifierInfo *ClassName,
-                                         SourceLocation ClassLoc,
-                                         IdentifierInfo *CatName,
-                                         SourceLocation CatLoc);
+  ObjCCategoryImplDecl *ActOnStartCategoryImplementation(
+                    SourceLocation AtCatImplLoc,
+                    IdentifierInfo *ClassName,
+                    SourceLocation ClassLoc,
+                    IdentifierInfo *CatName,
+                    SourceLocation CatLoc);
 
-  DeclGroupPtrTy ActOnFinishObjCImplementation(Decl *ObjCImpDecl,
+  DeclGroupPtrTy ActOnFinishObjCImplementation(ObjCImplDecl *ImplDecl,
                                                ArrayRef<Decl *> Decls);
 
   DeclGroupPtrTy ActOnForwardClassDeclaration(SourceLocation Loc,

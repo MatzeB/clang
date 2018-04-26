@@ -2094,7 +2094,7 @@ Parser::ParseObjCAtImplementationDeclaration(SourceLocation AtLoc) {
   // We have a class or category name - consume it.
   IdentifierInfo *nameId = Tok.getIdentifierInfo();
   SourceLocation nameLoc = ConsumeToken(); // consume class or category name
-  Decl *ObjCImpDecl = nullptr;
+  ObjCImplDecl *ImplDecl = nullptr;
 
   // Neither a type parameter list nor a list of protocol references is
   // permitted here. Parse and diagnose them.
@@ -2150,7 +2150,7 @@ Parser::ParseObjCAtImplementationDeclaration(SourceLocation AtLoc) {
                                         protocolLAngleLoc, protocolRAngleLoc,
                                         /*consumeLastToken=*/true);
     }
-    ObjCImpDecl = Actions.ActOnStartCategoryImplementation(
+    ImplDecl = Actions.ActOnStartCategoryImplementation(
                                     AtLoc, nameId, nameLoc, categoryId,
                                     categoryLoc);
 
@@ -2165,12 +2165,12 @@ Parser::ParseObjCAtImplementationDeclaration(SourceLocation AtLoc) {
       superClassId = Tok.getIdentifierInfo();
       superClassLoc = ConsumeToken(); // Consume super class name
     }
-    ObjCImpDecl = Actions.ActOnStartClassImplementation(
+    ImplDecl = Actions.ActOnStartClassImplementation(
                                     AtLoc, nameId, nameLoc,
                                     superClassId, superClassLoc);
 
     if (Tok.is(tok::l_brace)) // we have ivars
-      ParseObjCClassInstanceVariables(ObjCImpDecl, tok::objc_private, AtLoc);
+      ParseObjCClassInstanceVariables(ImplDecl, tok::objc_private, AtLoc);
     else if (Tok.is(tok::less)) { // we have illegal '<' try to recover
       Diag(Tok, diag::err_unexpected_protocol_qualifier);
 
@@ -2184,12 +2184,12 @@ Parser::ParseObjCAtImplementationDeclaration(SourceLocation AtLoc) {
                                         /*consumeLastToken=*/true);
     }
   }
-  assert(ObjCImpDecl);
+  assert(ImplDecl);
 
   SmallVector<Decl *, 8> DeclsInGroup;
 
   {
-    ObjCImplParsingDataRAII ObjCImplParsing(*this, ObjCImpDecl);
+    ObjCImplParsingDataRAII ObjCImplParsing(*this, ImplDecl);
     while (!ObjCImplParsing.isFinished() && !isEofOrEom()) {
       ParsedAttributesWithRange attrs(AttrFactory);
       MaybeParseCXX11Attributes(attrs);
@@ -2200,7 +2200,7 @@ Parser::ParseObjCAtImplementationDeclaration(SourceLocation AtLoc) {
     }
   }
 
-  return Actions.ActOnFinishObjCImplementation(ObjCImpDecl, DeclsInGroup);
+  return Actions.ActOnFinishObjCImplementation(ImplDecl, DeclsInGroup);
 }
 
 Parser::DeclGroupPtrTy
