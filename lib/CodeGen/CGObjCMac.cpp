@@ -1040,6 +1040,11 @@ public:
                                              bool NullTerminate = true);
 
 protected:
+  llvm::Function *resolveDirectCall(CodeGen::CodeGenFunction &CGF,
+                                    const ObjCMethodDecl *Method,
+                                    bool IsSuper, llvm::Value *Arg0,
+                                    const ObjCInterfaceDecl *ClassReceiver);
+
   CodeGen::RValue EmitMessageSend(CodeGen::CodeGenFunction &CGF,
                                   ReturnValueSlot Return,
                                   QualType ResultType,
@@ -1050,7 +1055,8 @@ protected:
                                   const CallArgList &CallArgs,
                                   const ObjCMethodDecl *OMD,
                                   const ObjCInterfaceDecl *ClassReceiver,
-                                  const ObjCCommonTypesHelper &ObjCTypes);
+                                  const ObjCCommonTypesHelper &ObjCTypes,
+                                  llvm::Function *DirectCall);
 
   /// EmitImageInfo - Emit the image info marker used to encode some module
   /// level information.
@@ -1995,56 +2001,70 @@ CGObjCMac::GenerateMessageSendSuper(CodeGen::CodeGenFunction &CGF,
                                     bool IsClassMessage,
                                     const CodeGen::CallArgList &CallArgs,
                                     const ObjCMethodDecl *Method) {
-  // Create and init a super structure; this is a (receiver, class)
-  // pair we will pass to objc_msgSendSuper.
-  Address ObjCSuper =
-    CGF.CreateTempAlloca(ObjCTypes.SuperTy, CGF.getPointerAlign(),
-                         "objc_super");
-  llvm::Value *ReceiverAsObject =
-    CGF.Builder.CreateBitCast(Receiver, ObjCTypes.ObjectPtrTy);
-  CGF.Builder.CreateStore(
-      ReceiverAsObject,
-      CGF.Builder.CreateStructGEP(ObjCSuper, 0, CharUnits::Zero()));
+  llvm::Function *DirectCall = resolveDirectCall(CGF, Method, true, Receiver,
+                                                 Class);
+  llvm::Value *ActualReceiver;
+  QualType ReceiverTy;
+  bool IsSuper;
+  if (DirectCall) {
+    ActualReceiver = Receiver;
+    ReceiverTy = CGF.getContext().getObjCIdType();
+    IsSuper = false;
+  } else {
+    // Create and init a super structure; this is a (receiver, class)
+    // pair we will pass to objc_msgSendSuper.
+    Address ObjCSuper =
+      CGF.CreateTempAlloca(ObjCTypes.SuperTy, CGF.getPointerAlign(),
+                           "objc_super");
+    llvm::Value *ReceiverAsObject =
+      CGF.Builder.CreateBitCast(Receiver, ObjCTypes.ObjectPtrTy);
+    CGF.Builder.CreateStore(
+        ReceiverAsObject,
+        CGF.Builder.CreateStructGEP(ObjCSuper, 0, CharUnits::Zero()));
 
-  // If this is a class message the metaclass is passed as the target.
-  llvm::Value *Target;
-  if (IsClassMessage) {
-    if (isCategoryImpl) {
-      // Message sent to 'super' in a class method defined in a category
-      // implementation requires an odd treatment.
-      // If we are in a class method, we must retrieve the
-      // _metaclass_ for the current class, pointed at by
-      // the class's "isa" pointer.  The following assumes that
-      // isa" is the first ivar in a class (which it must be).
+    // If this is a class message the metaclass is passed as the target.
+    llvm::Value *Target;
+    if (IsClassMessage) {
+      if (isCategoryImpl) {
+        // Message sent to 'super' in a class method defined in a category
+        // implementation requires an odd treatment.
+        // If we are in a class method, we must retrieve the
+        // _metaclass_ for the current class, pointed at by
+        // the class's "isa" pointer.  The following assumes that
+        // isa" is the first ivar in a class (which it must be).
+        Target = EmitClassRef(CGF, Class->getSuperClass());
+        Target = CGF.Builder.CreateStructGEP(ObjCTypes.ClassTy, Target, 0);
+        Target = CGF.Builder.CreateAlignedLoad(Target, CGF.getPointerAlign());
+      } else {
+        llvm::Constant *MetaClassPtr = EmitMetaClassRef(Class);
+        llvm::Value *SuperPtr =
+            CGF.Builder.CreateStructGEP(ObjCTypes.ClassTy, MetaClassPtr, 1);
+        llvm::Value *Super =
+          CGF.Builder.CreateAlignedLoad(SuperPtr, CGF.getPointerAlign());
+        Target = Super;
+      }
+    } else if (isCategoryImpl)
       Target = EmitClassRef(CGF, Class->getSuperClass());
-      Target = CGF.Builder.CreateStructGEP(ObjCTypes.ClassTy, Target, 0);
-      Target = CGF.Builder.CreateAlignedLoad(Target, CGF.getPointerAlign());
-    } else {
-      llvm::Constant *MetaClassPtr = EmitMetaClassRef(Class);
-      llvm::Value *SuperPtr =
-          CGF.Builder.CreateStructGEP(ObjCTypes.ClassTy, MetaClassPtr, 1);
-      llvm::Value *Super =
-        CGF.Builder.CreateAlignedLoad(SuperPtr, CGF.getPointerAlign());
-      Target = Super;
+    else {
+      llvm::Value *ClassPtr = EmitSuperClassRef(Class);
+      ClassPtr = CGF.Builder.CreateStructGEP(ObjCTypes.ClassTy, ClassPtr, 1);
+      Target = CGF.Builder.CreateAlignedLoad(ClassPtr, CGF.getPointerAlign());
     }
-  } else if (isCategoryImpl)
-    Target = EmitClassRef(CGF, Class->getSuperClass());
-  else {
-    llvm::Value *ClassPtr = EmitSuperClassRef(Class);
-    ClassPtr = CGF.Builder.CreateStructGEP(ObjCTypes.ClassTy, ClassPtr, 1);
-    Target = CGF.Builder.CreateAlignedLoad(ClassPtr, CGF.getPointerAlign());
+    // FIXME: We shouldn't need to do this cast, rectify the ASTContext and
+    // ObjCTypes types.
+    llvm::Type *ClassTy =
+      CGM.getTypes().ConvertType(CGF.getContext().getObjCClassType());
+    Target = CGF.Builder.CreateBitCast(Target, ClassTy);
+    CGF.Builder.CreateStore(Target,
+            CGF.Builder.CreateStructGEP(ObjCSuper, 1, CGF.getPointerSize()));
+
+    ActualReceiver = ObjCSuper.getPointer();
+    ReceiverTy = ObjCTypes.SuperPtrCTy;
+    IsSuper = true;
   }
-  // FIXME: We shouldn't need to do this cast, rectify the ASTContext and
-  // ObjCTypes types.
-  llvm::Type *ClassTy =
-    CGM.getTypes().ConvertType(CGF.getContext().getObjCClassType());
-  Target = CGF.Builder.CreateBitCast(Target, ClassTy);
-  CGF.Builder.CreateStore(Target,
-          CGF.Builder.CreateStructGEP(ObjCSuper, 1, CGF.getPointerSize()));
-  return EmitMessageSend(CGF, Return, ResultType,
-                         EmitSelector(CGF, Sel),
-                         ObjCSuper.getPointer(), ObjCTypes.SuperPtrCTy,
-                         true, CallArgs, Method, Class, ObjCTypes);
+  return EmitMessageSend(CGF, Return, ResultType, EmitSelector(CGF, Sel),
+                         ActualReceiver, ReceiverTy, IsSuper, CallArgs, Method,
+                         Class, ObjCTypes, DirectCall);
 }
 
 /// Generate code for a message send expression.
@@ -2056,10 +2076,12 @@ CodeGen::RValue CGObjCMac::GenerateMessageSend(CodeGen::CodeGenFunction &CGF,
                                                const CallArgList &CallArgs,
                                                const ObjCInterfaceDecl *Class,
                                                const ObjCMethodDecl *Method) {
+  llvm::Function *DirectCall = resolveDirectCall(CGF, Method, false, Receiver,
+                                                 Class);
   return EmitMessageSend(CGF, Return, ResultType,
                          EmitSelector(CGF, Sel),
                          Receiver, CGF.getContext().getObjCIdType(),
-                         false, CallArgs, Method, Class, ObjCTypes);
+                         false, CallArgs, Method, Class, ObjCTypes, DirectCall);
 }
 
 static bool isWeakLinkedClass(const ObjCInterfaceDecl *ID) {
@@ -2103,6 +2125,69 @@ static const ObjCMethodDecl *getImplementation(const ObjCMethodDecl *OMD) {
   return nullptr;
 }
 
+llvm::Function *
+CGObjCCommonMac::resolveDirectCall(CodeGen::CodeGenFunction &CGF,
+                                   const ObjCMethodDecl *Method,
+                                   bool IsSuper, llvm::Value *Arg0,
+                                   const ObjCInterfaceDecl *ClassReceiver) {
+  if (DirectCallHack && Method && Method->isPrivate()) {
+    assert(!Method->isRedeclaration());
+    llvm::errs() << "Call to private method: ["
+      << Method->getClassInterface()->getName()
+      << ' '
+      << Method->getSelector().getAsString() << "]\n";
+
+
+    bool ReceiverCanBeNull = true;
+
+    // Super dispatch assumes that self is non-null; even the messenger
+    // doesn't have a null check internally.
+    if (IsSuper) {
+      ReceiverCanBeNull = false;
+
+    // If this is a direct dispatch of a class method, check whether the class,
+    // or anything in its hierarchy, was weak-linked.
+    } else if (ClassReceiver && Method && Method->isClassMethod()) {
+      ReceiverCanBeNull = isWeakLinkedClass(ClassReceiver);
+
+    // If we're emitting a method, and self is const (meaning just ARC, for now),
+    // and the receiver is a load of self, then self is a valid object.
+    } else if (auto CurMethod =
+                 dyn_cast_or_null<ObjCMethodDecl>(CGF.CurCodeDecl)) {
+      auto Self = CurMethod->getSelfDecl();
+      if (Self->getType().isConstQualified()) {
+        if (auto LI = dyn_cast<llvm::LoadInst>(Arg0->stripPointerCasts())) {
+          llvm::Value *SelfAddr = CGF.GetAddrOfLocalVar(Self).getPointer();
+          if (SelfAddr == LI->getPointerOperand()) {
+            ReceiverCanBeNull = false;
+          }
+        }
+      }
+    }
+
+    if (ReceiverCanBeNull) {
+      llvm::errs() << "no direct call: Cannot prove non-null\n";
+      return nullptr;
+    }
+
+    const ObjCMethodDecl *Impl = getImplementation(Method);
+    if (!Impl) {
+      llvm::errs() << "no direct call: Cannot find definition\n";
+    } else {
+      // We should only ever see propety getters/setters coming out of class
+      // extensions. That ensures we can use Method->getClassInterface()
+      // for CD.
+      assert(!Method->isPropertyAccessor() ||
+             !isa<ObjCProtocolDecl>(Method->getDeclContext()));
+      const ObjCContainerDecl *CD = Impl->getClassInterface();
+      llvm::Function *Func = GenerateMethod(Impl, CD);
+      assert(Func);
+      return Func;
+    }
+  }
+  return nullptr;
+}
+
 CodeGen::RValue
 CGObjCCommonMac::EmitMessageSend(CodeGen::CodeGenFunction &CGF,
                                  ReturnValueSlot Return,
@@ -2114,7 +2199,8 @@ CGObjCCommonMac::EmitMessageSend(CodeGen::CodeGenFunction &CGF,
                                  const CallArgList &CallArgs,
                                  const ObjCMethodDecl *Method,
                                  const ObjCInterfaceDecl *ClassReceiver,
-                                 const ObjCCommonTypesHelper &ObjCTypes) {
+                                 const ObjCCommonTypesHelper &ObjCTypes,
+                                 llvm::Function *DirectCall) {
   CallArgList ActualArgs;
   if (!IsSuper)
     Arg0 = CGF.Builder.CreateBitCast(Arg0, ObjCTypes.ObjectPtrTy);
@@ -2159,52 +2245,30 @@ CGObjCCommonMac::EmitMessageSend(CodeGen::CodeGenFunction &CGF,
 
   bool RequiresNullCheck = false;
 
-  llvm::Constant *Fn = nullptr;
-  if (CGM.ReturnSlotInterferesWithArgs(MSI.CallInfo)) {
-    if (ReceiverCanBeNull) RequiresNullCheck = true;
-    Fn = (ObjCABI == 2) ?  ObjCTypes.getSendStretFn2(IsSuper)
-      : ObjCTypes.getSendStretFn(IsSuper);
-  } else if (CGM.ReturnTypeUsesFPRet(ResultType)) {
-    Fn = (ObjCABI == 2) ? ObjCTypes.getSendFpretFn2(IsSuper)
-      : ObjCTypes.getSendFpretFn(IsSuper);
-  } else if (CGM.ReturnTypeUsesFP2Ret(ResultType)) {
-    Fn = (ObjCABI == 2) ? ObjCTypes.getSendFp2RetFn2(IsSuper)
-      : ObjCTypes.getSendFp2retFn(IsSuper);
+  llvm::Constant *Fn;
+  if (DirectCall) {
+    Fn = DirectCall;
+    // Don't need the selector argument.
+    QualType ty = CGF.getContext().getObjCSelType();
+    ActualArgs[1] = CallArg(CGF.GetUndefRValue(ty), ty, false);
   } else {
-    // arm64 uses objc_msgSend for stret methods and yet null receiver check
-    // must be made for it.
-    if (ReceiverCanBeNull && CGM.ReturnTypeUsesSRet(MSI.CallInfo))
-      RequiresNullCheck = true;
-    Fn = (ObjCABI == 2) ? ObjCTypes.getSendFn2(IsSuper)
-      : ObjCTypes.getSendFn(IsSuper);
-
-    if (DirectCallHack && Method && Method->isPrivate()) {
-      assert(!Method->isRedeclaration());
-      llvm::errs() << "Call to private method: ["
-        << Method->getClassInterface()->getName()
-        << ' '
-        << Method->getSelector().getAsString() << "]\n";
-
-      if (ReceiverCanBeNull) {
-        llvm::errs() << "abort: Cannot prove non-null\n";
-      } else {
-        const ObjCMethodDecl *Impl = getImplementation(Method);
-        if (!Impl) {
-          llvm::errs() << "abort: Cannot find definition\n";
-        } else {
-          // We should only ever see propety getters/setters coming out of class
-          // extensions. That ensures we can use Method->getClassInterface()
-          // for CD.
-          assert(!Method->isPropertyAccessor() ||
-                 !isa<ObjCProtocolDecl>(Method->getDeclContext()));
-          const ObjCContainerDecl *CD = Impl->getClassInterface();
-          llvm::Function *Func = GenerateMethod(Impl, CD);
-          assert(Func);
-          Fn = Func;
-          QualType ty = CGF.getContext().getObjCSelType();
-          ActualArgs[1] = CallArg(CGF.GetUndefRValue(ty), ty, false);
-        }
-      }
+    if (CGM.ReturnSlotInterferesWithArgs(MSI.CallInfo)) {
+      if (ReceiverCanBeNull) RequiresNullCheck = true;
+      Fn = (ObjCABI == 2) ?  ObjCTypes.getSendStretFn2(IsSuper)
+        : ObjCTypes.getSendStretFn(IsSuper);
+    } else if (CGM.ReturnTypeUsesFPRet(ResultType)) {
+      Fn = (ObjCABI == 2) ? ObjCTypes.getSendFpretFn2(IsSuper)
+        : ObjCTypes.getSendFpretFn(IsSuper);
+    } else if (CGM.ReturnTypeUsesFP2Ret(ResultType)) {
+      Fn = (ObjCABI == 2) ? ObjCTypes.getSendFp2RetFn2(IsSuper)
+        : ObjCTypes.getSendFp2retFn(IsSuper);
+    } else {
+      // arm64 uses objc_msgSend for stret methods and yet null receiver check
+      // must be made for it.
+      if (ReceiverCanBeNull && CGM.ReturnTypeUsesSRet(MSI.CallInfo))
+        RequiresNullCheck = true;
+      Fn = (ObjCABI == 2) ? ObjCTypes.getSendFn2(IsSuper)
+        : ObjCTypes.getSendFn(IsSuper);
     }
   }
 
@@ -7176,14 +7240,16 @@ CGObjCNonFragileABIMac::GenerateMessageSend(CodeGen::CodeGenFunction &CGF,
                                             const CallArgList &CallArgs,
                                             const ObjCInterfaceDecl *Class,
                                             const ObjCMethodDecl *Method) {
-  return isVTableDispatchedSelector(Sel)
-    ? EmitVTableMessageSend(CGF, Return, ResultType, Sel,
-                            Receiver, CGF.getContext().getObjCIdType(),
-                            false, CallArgs, Method)
-    : EmitMessageSend(CGF, Return, ResultType,
-                      EmitSelector(CGF, Sel),
-                      Receiver, CGF.getContext().getObjCIdType(),
-                      false, CallArgs, Method, Class, ObjCTypes);
+  if (isVTableDispatchedSelector(Sel))
+    return EmitVTableMessageSend(CGF, Return, ResultType, Sel,
+                                 Receiver, CGF.getContext().getObjCIdType(),
+                                 false, CallArgs, Method);
+  llvm::Function *DirectCall = resolveDirectCall(CGF, Method, false, Receiver,
+                                                 Class);
+  return EmitMessageSend(CGF, Return, ResultType,
+                         EmitSelector(CGF, Sel),
+                         Receiver, CGF.getContext().getObjCIdType(),
+                         false, CallArgs, Method, Class, ObjCTypes, DirectCall);
 }
 
 llvm::Constant *
@@ -7337,42 +7403,57 @@ CGObjCNonFragileABIMac::GenerateMessageSendSuper(CodeGen::CodeGenFunction &CGF,
                                                  bool IsClassMessage,
                                                  const CodeGen::CallArgList &CallArgs,
                                                  const ObjCMethodDecl *Method) {
-  // ...
-  // Create and init a super structure; this is a (receiver, class)
-  // pair we will pass to objc_msgSendSuper.
-  Address ObjCSuper =
-    CGF.CreateTempAlloca(ObjCTypes.SuperTy, CGF.getPointerAlign(),
-                         "objc_super");
+  llvm::Function *DirectCall = nullptr;
+  if (!isVTableDispatchedSelector(Sel)) {
+    DirectCall = resolveDirectCall(CGF, Method, true, Receiver, Class);
+  }
+  llvm::Value *ActualReceiver;
+  QualType ReceiverTy;
+  bool IsSuper;
+  if (DirectCall) {
+    ActualReceiver = Receiver;
+    ReceiverTy = CGF.getContext().getObjCIdType();
+    IsSuper = false;
+  } else {
+    // ...
+    // Create and init a super structure; this is a (receiver, class)
+    // pair we will pass to objc_msgSendSuper.
+    Address ObjCSuper =
+      CGF.CreateTempAlloca(ObjCTypes.SuperTy, CGF.getPointerAlign(),
+                           "objc_super");
 
-  llvm::Value *ReceiverAsObject =
-    CGF.Builder.CreateBitCast(Receiver, ObjCTypes.ObjectPtrTy);
-  CGF.Builder.CreateStore(
-      ReceiverAsObject,
-      CGF.Builder.CreateStructGEP(ObjCSuper, 0, CharUnits::Zero()));
+    llvm::Value *ReceiverAsObject =
+      CGF.Builder.CreateBitCast(Receiver, ObjCTypes.ObjectPtrTy);
+    CGF.Builder.CreateStore(
+        ReceiverAsObject,
+        CGF.Builder.CreateStructGEP(ObjCSuper, 0, CharUnits::Zero()));
 
-  // If this is a class message the metaclass is passed as the target.
-  llvm::Value *Target;
-  if (IsClassMessage)
+    // If this is a class message the metaclass is passed as the target.
+    llvm::Value *Target;
+    if (IsClassMessage)
       Target = EmitMetaClassRef(CGF, Class, Class->isWeakImported());
-  else
-    Target = EmitSuperClassRef(CGF, Class);
+    else
+      Target = EmitSuperClassRef(CGF, Class);
 
-  // FIXME: We shouldn't need to do this cast, rectify the ASTContext and
-  // ObjCTypes types.
-  llvm::Type *ClassTy =
-    CGM.getTypes().ConvertType(CGF.getContext().getObjCClassType());
-  Target = CGF.Builder.CreateBitCast(Target, ClassTy);
-  CGF.Builder.CreateStore(
-      Target, CGF.Builder.CreateStructGEP(ObjCSuper, 1, CGF.getPointerSize()));
+    // FIXME: We shouldn't need to do this cast, rectify the ASTContext and
+    // ObjCTypes types.
+    llvm::Type *ClassTy =
+      CGM.getTypes().ConvertType(CGF.getContext().getObjCClassType());
+    Target = CGF.Builder.CreateBitCast(Target, ClassTy);
+    CGF.Builder.CreateStore(
+        Target, CGF.Builder.CreateStructGEP(ObjCSuper, 1, CGF.getPointerSize()));
 
-  return (isVTableDispatchedSelector(Sel))
-    ? EmitVTableMessageSend(CGF, Return, ResultType, Sel,
-                            ObjCSuper.getPointer(), ObjCTypes.SuperPtrCTy,
-                            true, CallArgs, Method)
-    : EmitMessageSend(CGF, Return, ResultType,
-                      EmitSelector(CGF, Sel),
-                      ObjCSuper.getPointer(), ObjCTypes.SuperPtrCTy,
-                      true, CallArgs, Method, Class, ObjCTypes);
+    ActualReceiver = ObjCSuper.getPointer();
+    ReceiverTy = ObjCTypes.SuperPtrCTy;
+    IsSuper = true;
+  }
+
+  return isVTableDispatchedSelector(Sel)
+    ? EmitVTableMessageSend(CGF, Return, ResultType, Sel, ActualReceiver,
+                            ReceiverTy, IsSuper, CallArgs, Method)
+    : EmitMessageSend(CGF, Return, ResultType, EmitSelector(CGF, Sel),
+                      ActualReceiver, ReceiverTy, IsSuper, CallArgs, Method,
+                      Class, ObjCTypes, DirectCall);
 }
 
 llvm::Value *CGObjCNonFragileABIMac::EmitSelector(CodeGenFunction &CGF,
