@@ -45,6 +45,8 @@ using namespace CodeGen;
 
 static llvm::cl::opt<bool> DirectCallHack("direct-call-hack");
 
+static llvm::cl::opt<bool> HidePrivateMethods("hide-private-methods");
+
 namespace {
 
 // FIXME: We should find a nicer way to make the labels for metadata, string
@@ -1048,7 +1050,7 @@ protected:
   CodeGen::RValue EmitMessageSend(CodeGen::CodeGenFunction &CGF,
                                   ReturnValueSlot Return,
                                   QualType ResultType,
-                                  llvm::Value *Sel,
+                                  Selector Sel,
                                   llvm::Value *Arg0,
                                   QualType Arg0Ty,
                                   bool IsSuper,
@@ -1061,6 +1063,8 @@ protected:
   /// EmitImageInfo - Emit the image info marker used to encode some module
   /// level information.
   void EmitImageInfo();
+
+  virtual llvm::Value *EmitSelector(CodeGenFunction &CGF, Selector Sel) = 0;
 
 public:
   CGObjCCommonMac(CodeGen::CodeGenModule &cgm) :
@@ -1281,7 +1285,7 @@ private:
 
   /// EmitSelector - Return a Value*, of type ObjCTypes.SelectorPtrTy,
   /// for the given selector.
-  llvm::Value *EmitSelector(CodeGenFunction &CGF, Selector Sel);
+  llvm::Value *EmitSelector(CodeGenFunction &CGF, Selector Sel) override;
   Address EmitSelectorAddr(CodeGenFunction &CGF, Selector Sel);
 
 public:
@@ -1503,7 +1507,7 @@ private:
 
   /// EmitSelector - Return a Value*, of type ObjCTypes.SelectorPtrTy,
   /// for the given selector.
-  llvm::Value *EmitSelector(CodeGenFunction &CGF, Selector Sel);
+  llvm::Value *EmitSelector(CodeGenFunction &CGF, Selector Sel) override;
   Address EmitSelectorAddr(CodeGenFunction &CGF, Selector Sel);
 
   /// GetInterfaceEHType - Get the cached ehtype for the given Objective-C
@@ -2062,9 +2066,9 @@ CGObjCMac::GenerateMessageSendSuper(CodeGen::CodeGenFunction &CGF,
     ReceiverTy = ObjCTypes.SuperPtrCTy;
     IsSuper = true;
   }
-  return EmitMessageSend(CGF, Return, ResultType, EmitSelector(CGF, Sel),
-                         ActualReceiver, ReceiverTy, IsSuper, CallArgs, Method,
-                         Class, ObjCTypes, DirectCall);
+  return EmitMessageSend(CGF, Return, ResultType, Sel, ActualReceiver,
+                         ReceiverTy, IsSuper, CallArgs, Method, Class,
+                         ObjCTypes, DirectCall);
 }
 
 /// Generate code for a message send expression.
@@ -2078,10 +2082,9 @@ CodeGen::RValue CGObjCMac::GenerateMessageSend(CodeGen::CodeGenFunction &CGF,
                                                const ObjCMethodDecl *Method) {
   llvm::Function *DirectCall = resolveDirectCall(CGF, Method, false, Receiver,
                                                  Class);
-  return EmitMessageSend(CGF, Return, ResultType,
-                         EmitSelector(CGF, Sel),
-                         Receiver, CGF.getContext().getObjCIdType(),
-                         false, CallArgs, Method, Class, ObjCTypes, DirectCall);
+  return EmitMessageSend(CGF, Return, ResultType, Sel, Receiver,
+                         CGF.getContext().getObjCIdType(), false, CallArgs,
+                         Method, Class, ObjCTypes, DirectCall);
 }
 
 static bool isWeakLinkedClass(const ObjCInterfaceDecl *ID) {
@@ -2137,7 +2140,7 @@ CGObjCCommonMac::resolveDirectCall(CodeGen::CodeGenFunction &CGF,
       << ' '
       << Method->getSelector().getAsString() << "]\n";
 
-
+#if 0
     bool ReceiverCanBeNull = true;
 
     // Super dispatch assumes that self is non-null; even the messenger
@@ -2169,6 +2172,7 @@ CGObjCCommonMac::resolveDirectCall(CodeGen::CodeGenFunction &CGF,
       llvm::errs() << "no direct call: Cannot prove non-null\n";
       return nullptr;
     }
+#endif
 
     const ObjCMethodDecl *Impl = getImplementation(Method);
     if (!Impl) {
@@ -2192,7 +2196,7 @@ CodeGen::RValue
 CGObjCCommonMac::EmitMessageSend(CodeGen::CodeGenFunction &CGF,
                                  ReturnValueSlot Return,
                                  QualType ResultType,
-                                 llvm::Value *Sel,
+                                 Selector Sel,
                                  llvm::Value *Arg0,
                                  QualType Arg0Ty,
                                  bool IsSuper,
@@ -2205,7 +2209,13 @@ CGObjCCommonMac::EmitMessageSend(CodeGen::CodeGenFunction &CGF,
   if (!IsSuper)
     Arg0 = CGF.Builder.CreateBitCast(Arg0, ObjCTypes.ObjectPtrTy);
   ActualArgs.add(RValue::get(Arg0), Arg0Ty);
-  ActualArgs.add(RValue::get(Sel), CGF.getContext().getObjCSelType());
+  QualType SelTy = CGF.getContext().getObjCSelType();
+  if (!DirectCall) {
+    llvm::Value *SelValue = EmitSelector(CGF, Sel);
+    ActualArgs.add(RValue::get(SelValue), SelTy);
+  } else {
+    ActualArgs.add(CGF.GetUndefRValue(SelTy), SelTy);
+  }
   ActualArgs.addFrom(CallArgs);
 
   // If we're calling a method, use the formal signature.
@@ -2248,9 +2258,7 @@ CGObjCCommonMac::EmitMessageSend(CodeGen::CodeGenFunction &CGF,
   llvm::Constant *Fn;
   if (DirectCall) {
     Fn = DirectCall;
-    // Don't need the selector argument.
-    QualType ty = CGF.getContext().getObjCSelType();
-    ActualArgs[1] = CallArg(CGF.GetUndefRValue(ty), ty, false);
+    RequiresNullCheck = ReceiverCanBeNull;
   } else {
     if (CGM.ReturnSlotInterferesWithArgs(MSI.CallInfo)) {
       if (ReceiverCanBeNull) RequiresNullCheck = true;
@@ -3880,6 +3888,27 @@ void CGObjCMac::emitMethodConstant(ConstantArrayBuilder &builder,
   method.finishAndAddTo(builder);
 }
 
+static bool skip_from_method_list(const ObjCMethodDecl *OMD) {
+  if (!HidePrivateMethods || !DirectCallHack)
+    return false;
+  if (!OMD->isPrivate() || OMD->isOverriding())
+    return false;
+  if (!isa<ObjCImplementationDecl>(OMD->getDeclContext()))
+    return false;
+  bool FoundInClassExt = false;
+  if (const ObjCInterfaceDecl *IF = OMD->getClassInterface()) {
+    Selector Sel = OMD->getSelector();
+    bool IsInstance = OMD->isInstanceMethod();
+    for (const ObjCCategoryDecl *EXT : IF->known_extensions()) {
+      if (EXT->getMethod(Sel, IsInstance)) {
+        FoundInClassExt = true;
+        break;
+      }
+    }
+  }
+  return FoundInClassExt;
+}
+
 /// Build a struct objc_method_list or struct objc_method_description_list,
 /// as appropriate.
 ///
@@ -3972,6 +4001,8 @@ llvm::Constant *CGObjCMac::emitMethodList(Twine name, MethodListType MLT,
   values.addInt(ObjCTypes.IntTy, methods.size());
   auto methodArray = values.beginArray(ObjCTypes.MethodTy);
   for (auto MD : methods) {
+    if (skip_from_method_list(MD))
+      continue;
     emitMethodConstant(methodArray, MD);
   }
   methodArray.finishAndAddTo(values);
@@ -6719,6 +6750,8 @@ CGObjCNonFragileABIMac::emitMethodList(Twine name, MethodListType kind,
   values.addInt(ObjCTypes.IntTy, methods.size());
   auto methodArray = values.beginArray(ObjCTypes.MethodTy);
   for (auto MD : methods) {
+    if (skip_from_method_list(MD))
+      continue;
     emitMethodConstant(methodArray, MD, forProtocol);
   }
   methodArray.finishAndAddTo(values);
@@ -7246,10 +7279,9 @@ CGObjCNonFragileABIMac::GenerateMessageSend(CodeGen::CodeGenFunction &CGF,
                                  false, CallArgs, Method);
   llvm::Function *DirectCall = resolveDirectCall(CGF, Method, false, Receiver,
                                                  Class);
-  return EmitMessageSend(CGF, Return, ResultType,
-                         EmitSelector(CGF, Sel),
-                         Receiver, CGF.getContext().getObjCIdType(),
-                         false, CallArgs, Method, Class, ObjCTypes, DirectCall);
+  return EmitMessageSend(CGF, Return, ResultType, Sel, Receiver,
+                         CGF.getContext().getObjCIdType(), false, CallArgs,
+                         Method, Class, ObjCTypes, DirectCall);
 }
 
 llvm::Constant *
@@ -7451,9 +7483,8 @@ CGObjCNonFragileABIMac::GenerateMessageSendSuper(CodeGen::CodeGenFunction &CGF,
   return isVTableDispatchedSelector(Sel)
     ? EmitVTableMessageSend(CGF, Return, ResultType, Sel, ActualReceiver,
                             ReceiverTy, IsSuper, CallArgs, Method)
-    : EmitMessageSend(CGF, Return, ResultType, EmitSelector(CGF, Sel),
-                      ActualReceiver, ReceiverTy, IsSuper, CallArgs, Method,
-                      Class, ObjCTypes, DirectCall);
+    : EmitMessageSend(CGF, Return, ResultType, Sel, ActualReceiver, ReceiverTy,
+                      IsSuper, CallArgs, Method, Class, ObjCTypes, DirectCall);
 }
 
 llvm::Value *CGObjCNonFragileABIMac::EmitSelector(CodeGenFunction &CGF,
