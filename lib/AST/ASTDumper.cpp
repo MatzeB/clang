@@ -1781,6 +1781,9 @@ void ASTDumper::VisitObjCMethodDecl(const ObjCMethodDecl *D) {
       dumpDecl(Parameter);
   }
 
+  if (D->isPrivate())
+    OS << " private";
+
   if (D->isVariadic())
     dumpChild([=] { OS << "..."; });
 
@@ -1895,6 +1898,9 @@ void ASTDumper::VisitObjCPropertyDecl(const ObjCPropertyDecl *D) {
     if (Attrs & ObjCPropertyDecl::OBJC_PR_setter)
       dumpDeclRef(D->getSetterMethodDecl(), "setter");
   }
+
+  if (D->isPrivate())
+    OS << " private";
 }
 
 void ASTDumper::VisitObjCPropertyImplDecl(const ObjCPropertyImplDecl *D) {

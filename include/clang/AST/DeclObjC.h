@@ -189,6 +189,11 @@ private:
   /// Indicates if the method was a definition but its body was skipped.
   unsigned HasSkippedBody : 1;
 
+  /// Whether the method is only known inside the current compilation unit.
+  unsigned IsPrivate : 1;
+
+private:
+
   // Return type of this method.
   QualType MethodDeclType;
 
@@ -229,7 +234,8 @@ private:
         objcDeclQualifier(OBJC_TQ_None),
         RelatedResultType(HasRelatedResultType),
         SelLocsKind(SelLoc_StandardNoSpace), IsOverriding(0), HasSkippedBody(0),
-        MethodDeclType(T), ReturnTInfo(ReturnTInfo), DeclEndLoc(endLoc) {
+        IsPrivate(0), MethodDeclType(T), ReturnTInfo(ReturnTInfo),
+        DeclEndLoc(endLoc) {
     setImplicit(isImplicitlyDeclared);
   }
 
@@ -487,7 +493,10 @@ public:
   bool hasSkippedBody() const { return HasSkippedBody; }
   void setHasSkippedBody(bool Skipped = true) { HasSkippedBody = Skipped; }
 
-  /// Returns the property associated with this method's selector.
+  bool isPrivate() const { return IsPrivate; }
+  void setPrivate(bool Private = true) { IsPrivate = Private; }
+
+  /// \brief Returns the property associated with this method's selector.
   ///
   /// Note that even if this particular method is not marked as a property
   /// accessor, it is still possible for it to match a property declared in a
@@ -792,6 +801,9 @@ private:
   // \@required/\@optional
   unsigned PropertyImplementation : 2;
 
+  /// Whether the property is only known within the current compilation unit.
+  unsigned IsPrivate : 1;
+
   // getter name of NULL if no getter
   Selector GetterName;
 
@@ -821,7 +833,7 @@ private:
       LParenLoc(LParenLocation), DeclType(T), DeclTypeSourceInfo(TSI),
       PropertyAttributes(OBJC_PR_noattr),
       PropertyAttributesAsWritten(OBJC_PR_noattr),
-      PropertyImplementation(propControl), GetterName(Selector()),
+      PropertyImplementation(propControl), IsPrivate(0), GetterName(Selector()),
       SetterName(Selector()) {}
 
 public:
@@ -962,6 +974,9 @@ public:
   ObjCIvarDecl *getPropertyIvarDecl() const {
     return PropertyIvarDecl;
   }
+
+  bool isPrivate() const { return IsPrivate; }
+  void setPrivate(bool Private = true) { IsPrivate = Private; }
 
   SourceRange getSourceRange() const override LLVM_READONLY {
     return SourceRange(AtLoc, getLocation());
