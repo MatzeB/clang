@@ -418,6 +418,7 @@ void Sema::ActOnStartOfObjCMethodDef(Scope *FnBodyScope, Decl *D) {
       IC->lookupMethod(MDecl->getSelector(), MDecl->isInstanceMethod());
     
     if (IMD) {
+      MDecl->setPrivate(MDecl->isPrivate() & IMD->isPrivate());
       ObjCImplDecl *ImplDeclOfMethodDef = 
         dyn_cast<ObjCImplDecl>(MDecl->getDeclContext());
       ObjCContainerDecl *ContDeclOfMethodDecl = 
@@ -2072,6 +2073,41 @@ ObjCImplementationDecl *Sema::ActOnStartClassImplementation(
   return IMPDecl;
 }
 
+static void
+onMethodDeclsContainer(ObjCContainerDecl *CD,
+                       std::function<void(ObjCMethodDecl *OMD)> Func) {
+  for (ObjCMethodDecl *OMD : CD->methods())
+    Func(OMD);
+}
+
+static void
+onMethodDeclsProtocol(ObjCProtocolDecl *PD,
+                      std::function<void(ObjCMethodDecl *OMD)> Func) {
+  onMethodDeclsContainer(PD, Func);
+  for (ObjCProtocolDecl *PD : PD->protocols())
+    onMethodDeclsProtocol(PD, Func);
+}
+
+static void
+onMethodDeclsCategory(ObjCCategoryDecl *CD,
+                      std::function<void(ObjCMethodDecl *OMD)> Func) {
+  onMethodDeclsContainer(CD, Func);
+  for (ObjCProtocolDecl *PD : CD->protocols())
+    onMethodDeclsProtocol(PD, Func);
+}
+
+static void
+onMethodDeclsInterface(ObjCInterfaceDecl *IF,
+                       std::function<void(ObjCMethodDecl *OMD)> Func) {
+  onMethodDeclsContainer(IF, Func);
+  for (ObjCProtocolDecl *PD : IF->protocols())
+    onMethodDeclsProtocol(PD, Func);
+  for (ObjCCategoryDecl *CD : IF->known_categories())
+    onMethodDeclsCategory(CD, Func);
+  if (ObjCInterfaceDecl *SCIF = IF->getSuperClass())
+    onMethodDeclsInterface(SCIF, Func);
+}
+
 Sema::DeclGroupPtrTy
 Sema::ActOnFinishObjCImplementation(ObjCImplDecl *ImplDecl,
                                     ArrayRef<Decl *> Decls) {
@@ -2088,6 +2124,23 @@ Sema::ActOnFinishObjCImplementation(ObjCImplDecl *ImplDecl,
   }
 
   DeclsInGroup.push_back(ImplDecl);
+
+  // Go through method list and re-evaluate private/public state of things
+  // defined in multiple places.
+  if (ObjCInterfaceDecl *IF = ImplDecl->getClassInterface()) {
+    llvm::SmallSet<Selector, 20> PublicInstanceSelectors;
+    onMethodDeclsInterface(IF,
+      [&PublicInstanceSelectors](ObjCMethodDecl *OMD) {
+        if (OMD->isInstanceMethod() && !OMD->isPrivate())
+          PublicInstanceSelectors.insert(OMD->getSelector());
+    });
+
+    onMethodDeclsInterface(IF,
+      [&PublicInstanceSelectors](ObjCMethodDecl *OMD) {
+      if (OMD->isPrivate() && PublicInstanceSelectors.count(OMD->getSelector()))
+        OMD->setPrivate(false);
+    });
+  }
 
   return BuildDeclaratorGroup(DeclsInGroup);
 }
@@ -4651,6 +4704,7 @@ Decl *Sema::ActOnMethodDeclaration(
   AddPragmaAttributes(TUScope, ObjCMethod);
 
   // Add the method now.
+  bool IsPrivate;
   const ObjCMethodDecl *PrevMethod = nullptr;
   if (ObjCImplDecl *ImpDecl = dyn_cast<ObjCImplDecl>(ClassDecl)) {
     if (MethodType == tok::minus) {
@@ -4663,9 +4717,11 @@ Decl *Sema::ActOnMethodDeclaration(
 
     // Merge information from the @interface declaration into the
     // @implementation.
+    IsPrivate = ObjCMethod->isInstanceMethod();
     if (ObjCInterfaceDecl *IDecl = ImpDecl->getClassInterface()) {
       if (auto *IMD = IDecl->lookupMethod(ObjCMethod->getSelector(),
                                           ObjCMethod->isInstanceMethod())) {
+        IsPrivate &= IMD->isPrivate();
         mergeInterfaceMethodToImpl(*this, ObjCMethod, IMD);
 
         // Warn about defining -dealloc in a category.
@@ -4678,7 +4734,15 @@ Decl *Sema::ActOnMethodDeclaration(
     }
   } else {
     cast<DeclContext>(ClassDecl)->addDecl(ObjCMethod);
+    if (isa<ObjCInterfaceDecl>(ClassDecl) || isa<ObjCProtocolDecl>(ClassDecl)) {
+      IsPrivate = false;
+    } else {
+      const auto *OCD = cast<const ObjCCategoryDecl>(ClassDecl);
+      IsPrivate = ObjCMethod->isInstanceMethod() &&
+        OCD->IsClassExtension() && getSourceManager().isInMainFile(MethodLoc);
+    }
   }
+  ObjCMethod->setPrivate(IsPrivate);
 
   if (PrevMethod) {
     // You can never have two method definitions with the same name.

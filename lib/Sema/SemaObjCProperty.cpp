@@ -522,6 +522,8 @@ Sema::HandlePropertyInClassExtension(Scope *S,
                                                isReadWrite,
                                                Attributes, AttributesAsWritten,
                                                T, TSI, MethodImplKind, DC);
+  PDecl->setPrivate(PDecl->isInstanceProperty() &&
+                    Context.getSourceManager().isInMainFile(AtLoc));
 
   // If there was no declaration of a property with the same name in
   // the primary class, we're done.
@@ -1081,9 +1083,21 @@ Decl *Sema::ActOnPropertyImplDecl(Scope *S,
       Diag(PropertyLoc, diag::err_bad_property_decl) << IDecl->getDeclName();
       return nullptr;
     }
-    if (property->isClassProperty() && Synthesize) {
-      Diag(PropertyLoc, diag::err_synthesize_on_class_property) << PropertyId;
-      return nullptr;
+    if (Synthesize) {
+      if (property->isClassProperty()) {
+        Diag(PropertyLoc, diag::err_synthesize_on_class_property) << PropertyId;
+        return nullptr;
+      }
+    } else {
+      // @dynamic hints that this is isn't really private.
+      // Retroactively mark property as non-private.
+      property->setPrivate(false);
+      if (ObjCMethodDecl *Getter = property->getGetterMethodDecl())
+        if (Getter->isImplicit())
+          Getter->setPrivate(false);
+      if (ObjCMethodDecl *Setter = property->getSetterMethodDecl())
+        if (Setter->isImplicit())
+          Setter->setPrivate(false);
     }
     unsigned PIkind = property->getPropertyAttributesAsWritten();
     if ((PIkind & (ObjCPropertyDecl::OBJC_PR_atomic |
@@ -2399,6 +2413,7 @@ void Sema::ProcessPropertyDecl(ObjCPropertyDecl *property) {
                               ObjCPropertyDecl::Optional) ?
                              ObjCMethodDecl::Optional :
                              ObjCMethodDecl::Required);
+    GetterMethod->setPrivate(property->isPrivate());
     CD->addDecl(GetterMethod);
 
     AddPropertyAttrs(*this, GetterMethod, property);
@@ -2446,6 +2461,7 @@ void Sema::ProcessPropertyDecl(ObjCPropertyDecl *property) {
                                 ObjCPropertyDecl::Optional) ?
                                 ObjCMethodDecl::Optional :
                                 ObjCMethodDecl::Required);
+      SetterMethod->setPrivate(property->isPrivate());
 
       // Remove all qualifiers from the setter's parameter type.
       QualType paramTy =
