@@ -43,6 +43,8 @@
 using namespace clang;
 using namespace CodeGen;
 
+static llvm::cl::opt<bool> DirectCallHack("direct-call-hack");
+
 namespace {
 
 // FIXME: We should find a nicer way to make the labels for metadata, string
@@ -846,6 +848,8 @@ protected:
   /// MethodVarTypes - uniqued method type signatures. We have to use
   /// a StringMap here because have no other unique reference.
   llvm::StringMap<llvm::GlobalVariable*> MethodVarTypes;
+
+  llvm::DenseMap<const ObjCMethodDecl*, llvm::Function*> MethodDecls;
 
   /// MethodDefinitions - map of methods which have been defined in
   /// this translation unit.
@@ -2067,6 +2071,38 @@ static bool isWeakLinkedClass(const ObjCInterfaceDecl *ID) {
   return false;
 }
 
+static const ObjCMethodDecl *getImplementation(const ObjCMethodDecl *OMD) {
+  const DeclContext *CtxD = OMD->getDeclContext();
+
+  assert(!OMD->isRedeclaration() && "TODO: deal with redecls");
+  Selector SEL = OMD->getSelector();
+  bool IsInstanceMethod = OMD->isInstanceMethod();
+  if (const ObjCInterfaceDecl *IFD = dyn_cast<ObjCInterfaceDecl>(CtxD)) {
+    if (const ObjCImplementationDecl *IMP = IFD->getImplementation()) {
+      if (const ObjCMethodDecl *MD = IMP->getMethod(SEL, IsInstanceMethod))
+        return MD;
+    }
+  } else if (const ObjCCategoryDecl *CD = dyn_cast<ObjCCategoryDecl>(CtxD)) {
+    if (const ObjCInterfaceDecl *IFD = CD->getClassInterface()) {
+      if (const ObjCImplementationDecl *IMP = IFD->getImplementation()) {
+        if (const ObjCMethodDecl *MD = IMP->getMethod(SEL, IsInstanceMethod))
+          return MD;
+      }
+    }
+    if (OMD->isPropertyAccessor()) {
+      // ugh, synthesized/implicitely created getters/setters currently don't
+      // get an ObjCMethodDecl created in the impl... Return OMD for now.
+      return OMD;
+    }
+  } else if (isa<ObjCImplementationDecl>(CtxD) ||
+             isa<ObjCCategoryImplDecl>(CtxD)) {
+    return OMD;
+  } else {
+    assert(isa<ObjCProtocolDecl>(CtxD));
+  }
+  return nullptr;
+}
+
 CodeGen::RValue
 CGObjCCommonMac::EmitMessageSend(CodeGen::CodeGenFunction &CGF,
                                  ReturnValueSlot Return,
@@ -2141,6 +2177,35 @@ CGObjCCommonMac::EmitMessageSend(CodeGen::CodeGenFunction &CGF,
       RequiresNullCheck = true;
     Fn = (ObjCABI == 2) ? ObjCTypes.getSendFn2(IsSuper)
       : ObjCTypes.getSendFn(IsSuper);
+
+    if (DirectCallHack && Method && Method->isPrivate()) {
+      assert(!Method->isRedeclaration());
+      llvm::errs() << "Call to private method: ["
+        << Method->getClassInterface()->getName()
+        << ' '
+        << Method->getSelector().getAsString() << "]\n";
+
+      if (ReceiverCanBeNull) {
+        llvm::errs() << "abort: Cannot prove non-null\n";
+      } else {
+        const ObjCMethodDecl *Impl = getImplementation(Method);
+        if (!Impl) {
+          llvm::errs() << "abort: Cannot find definition\n";
+        } else {
+          // We should only ever see propety getters/setters coming out of class
+          // extensions. That ensures we can use Method->getClassInterface()
+          // for CD.
+          assert(!Method->isPropertyAccessor() ||
+                 !isa<ObjCProtocolDecl>(Method->getDeclContext()));
+          const ObjCContainerDecl *CD = Impl->getClassInterface();
+          llvm::Function *Func = GenerateMethod(Impl, CD);
+          assert(Func);
+          Fn = Func;
+          QualType ty = CGF.getContext().getObjCSelType();
+          ActualArgs[1] = CallArg(CGF.GetUndefRValue(ty), ty, false);
+        }
+      }
+    }
   }
 
   // We don't need to emit a null check to zero out an indirect result if the
@@ -3854,6 +3919,15 @@ llvm::Constant *CGObjCMac::emitMethodList(Twine name, MethodListType MLT,
 
 llvm::Function *CGObjCCommonMac::GenerateMethod(const ObjCMethodDecl *OMD,
                                                 const ObjCContainerDecl *CD) {
+  if (OMD->isPrivate()) {
+    llvm::DenseMap<const ObjCMethodDecl*, llvm::Function*>::iterator
+        I = MethodDecls.find(OMD);
+    if (I != MethodDecls.end()) {
+      MethodDefinitions.insert(std::make_pair(OMD, I->second));
+      return I->second;
+    }
+  }
+
   SmallString<256> Name;
   GetNameForMethod(OMD, CD, Name);
 
@@ -3866,6 +3940,8 @@ llvm::Function *CGObjCCommonMac::GenerateMethod(const ObjCMethodDecl *OMD,
                            Name.str(),
                            &CGM.getModule());
   MethodDefinitions.insert(std::make_pair(OMD, Method));
+  if (OMD->isPrivate())
+    MethodDecls.insert(std::make_pair(OMD, Method));
 
   return Method;
 }
