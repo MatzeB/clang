@@ -25,8 +25,14 @@
 #include "llvm/IR/CallSite.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/Support/LockFileManager.h"
 using namespace clang;
 using namespace CodeGen;
+
+static llvm::cl::opt<std::string>
+WritePrivateMethods("write-private-methods");
+
+static std::vector<const ObjCMethodDecl*> PrivateMethods;
 
 typedef llvm::PointerIntPair<llvm::Value*,1,bool> TryEmitResult;
 static TryEmitResult
@@ -576,6 +582,9 @@ void CodeGenFunction::GenerateObjCMethod(const ObjCMethodDecl *OMD) {
   incrementProfileCounter(OMD->getBody());
   EmitCompoundStmtWithoutScope(*cast<CompoundStmt>(OMD->getBody()));
   FinishFunction(OMD->getBodyRBrace());
+
+  if (!WritePrivateMethods.empty() && OMD->isPrivate())
+    PrivateMethods.push_back(OMD);
 }
 
 /// emitStructGetterCall - Call the runtime function to load a property
@@ -819,6 +828,9 @@ void CodeGenFunction::GenerateObjCGetter(ObjCImplementationDecl *IMP,
   generateObjCGetterBody(IMP, PID, OMD, AtomicHelperFn);
 
   FinishFunction();
+
+  if (!WritePrivateMethods.empty() && OMD->isPrivate())
+    PrivateMethods.push_back(OMD);
 }
 
 static bool hasTrivialGetExpr(const ObjCPropertyImplDecl *propImpl) {
@@ -1352,6 +1364,9 @@ void CodeGenFunction::GenerateObjCSetter(ObjCImplementationDecl *IMP,
   generateObjCSetterBody(IMP, PID, AtomicHelperFn);
 
   FinishFunction();
+
+  if (!WritePrivateMethods.empty() && OMD->isPrivate())
+    PrivateMethods.push_back(OMD);
 }
 
 namespace {
@@ -3465,6 +3480,20 @@ void CodeGenModule::emitAtAvailableLinkGuard() {
   CGF.EmitNounwindRuntimeCall(CFFunc, llvm::Constant::getNullValue(VoidPtrTy));
   CGF.Builder.CreateUnreachable();
   addCompilerUsedGlobal(CFLinkCheckFunc);
+}
+
+void CGObjCRuntime::Release() {
+  if (!WritePrivateMethods.empty() && !PrivateMethods.empty()) {
+    llvm::LockFileManager Locked(WritePrivateMethods);
+    std::error_code EC;
+    llvm::raw_fd_ostream os(WritePrivateMethods, EC, llvm::sys::fs::F_Append);
+    if (EC) {
+      llvm::errs() << "Could not open " << WritePrivateMethods << '\n';
+    } else {
+      for (const ObjCMethodDecl *OMD : PrivateMethods)
+        os << OMD->getSelector().getAsString() << '\n';
+    }
+  }
 }
 
 CGObjCRuntime::~CGObjCRuntime() {}

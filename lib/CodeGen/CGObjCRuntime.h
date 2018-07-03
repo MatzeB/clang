@@ -120,6 +120,8 @@ public:
   /// this compilation unit with the runtime library.
   virtual llvm::Function *ModuleInitFunction() = 0;
 
+  virtual void Release();
+
   /// Get a selector for the specified name and type values.
   /// The result should have the LLVM type for ASTContext::getObjCSelType().
   virtual llvm::Value *GetSelector(CodeGenFunction &CGF, Selector Sel) = 0;
